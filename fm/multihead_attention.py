@@ -12,6 +12,8 @@ from torch import Tensor, nn
 from torch.nn import Parameter
 
 import uuid
+import loralib as lora
+import deepspeed
 
 def utils_softmax(x, dim: int, onnx_trace: bool = False):
     if onnx_trace:
@@ -78,12 +80,18 @@ class MultiheadAttention(nn.Module):
         add_zero_attn=False,
         self_attention=False,
         encoder_decoder_attention=False,
+        q_lora_rank=None,
+        v_lora_rank=None,
+        k_lora_rank=None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
         self.qkv_same_dim = self.kdim == embed_dim and self.vdim == embed_dim
+        self.q_lora_rank = q_lora_rank
+        self.v_lora_rank = v_lora_rank
+        self.k_lora_rank = k_lora_rank
 
         self.num_heads = num_heads
         self.dropout = dropout
@@ -99,10 +107,21 @@ class MultiheadAttention(nn.Module):
         assert not self.self_attention or self.qkv_same_dim, (
             "Self-attention requires query, key and " "value to be of the same size"
         )
-
-        self.k_proj = nn.Linear(self.kdim, embed_dim, bias=bias)
-        self.v_proj = nn.Linear(self.vdim, embed_dim, bias=bias)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        # optionally add LoRA adapters 
+        if self.k_lora_rank is not None:
+            self.k_proj = lora.Linear(self.kdim, embed_dim,r=k_lora_rank, bias=bias)
+        else: 
+            self.k_proj = nn.Linear(self.kdim, embed_dim, bias=bias)
+        
+        if self.v_lora_rank is not None: 
+            self.v_proj = lora.Linear(self.vdim, embed_dim, r=v_lora_rank, bias=bias)
+        else:
+            self.v_proj = nn.Linear(self.vdim, embed_dim, bias=bias)
+        
+        if self.q_lora_rank is not None:
+            self.q_proj = lora.Linear(embed_dim, embed_dim,r=q_lora_rank, bias=bias)
+        else:
+            self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
@@ -184,6 +203,7 @@ class MultiheadAttention(nn.Module):
         assert embed_dim == self.embed_dim
         assert list(query.size()) == [tgt_len, bsz, embed_dim]
 
+        using_lora = self.q_lora_rank is not None or self.k_lora_rank is not None or self.v_lora_rank is not None
         if (
             self.enable_torch_version
             and not self.onnx_trace
@@ -193,8 +213,10 @@ class MultiheadAttention(nn.Module):
             # treats bias in linear module as method.
             and not torch.jit.is_scripting()
             and not need_head_weights
+            and not using_lora
         ):
             assert key is not None and value is not None
+            
             return F.multi_head_attention_forward(
                 query,
                 key,
@@ -259,6 +281,7 @@ class MultiheadAttention(nn.Module):
                 attn_mask = torch.cat(
                     [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
                 )
+                #print(f'ATTN MASK = {attn_mask}')
             if key_padding_mask is not None:
                 key_padding_mask = torch.cat(
                     [
@@ -374,7 +397,7 @@ class MultiheadAttention(nn.Module):
                 key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf")
             )
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-
+        
         if before_softmax:
             return attn_weights, v
 

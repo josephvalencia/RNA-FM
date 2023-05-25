@@ -8,6 +8,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import loralib as lora
+import deepspeed
 
 from .modules import (
     TransformerLayer,
@@ -86,6 +88,24 @@ class RNABertModel(nn.Module):
             metavar="N",
             help="number of attention heads",
         )
+        parser.add_argument(
+            "--q_lora_rank",
+            default=None,
+            type=int,
+            help="rank of update to q attention matrix",
+        )
+        parser.add_argument(
+            "--v_lora_rank",
+            default=None,
+            type=int,
+            help="rank of update to v attention matrix",
+        )
+        parser.add_argument(
+            "--k_lora_rank",
+            default=None,
+            type=int,
+            help="rank of update to k attention matrix",
+        )
 
     def __init__(self, args, alphabet):
         super().__init__()
@@ -105,15 +125,21 @@ class RNABertModel(nn.Module):
             self._init_submodules_esm1()
 
     def _init_submodules_common(self):
+        
         self.embed_tokens = nn.Embedding(
             self.alphabet_size, self.args.embed_dim, padding_idx=self.padding_idx
         )
+        
         self.layers = nn.ModuleList(
             [
                 TransformerLayer(
                     self.args.embed_dim, self.args.ffn_embed_dim, self.args.attention_heads,
                     add_bias_kv=(self.model_version != 'ESM-1b'),
                     use_esm1b_layer_norm=(self.model_version == 'ESM-1b'),
+                    q_lora_rank=self.args.q_lora_rank,
+                    k_lora_rank=None,
+                    v_lora_rank=self.args.v_lora_rank
+
                 )
                 for _ in range(self.args.layers)
             ]
@@ -150,7 +176,8 @@ class RNABertModel(nn.Module):
             self.embed_out_bias = nn.Parameter(torch.zeros(self.alphabet_size))
 
     # CJY at 2021.10.20 add masked_tokens for lm_head
-    def forward(self, tokens, repr_layers=[], need_head_weights=False, return_contacts=False, masked_tokens=None):
+    def forward(self, tokens, repr_layers=[], need_head_weights=False,
+                return_contacts=False, masked_tokens=None, checkpoint_activations=False):
         if return_contacts:
             need_head_weights = True
 
@@ -187,15 +214,23 @@ class RNABertModel(nn.Module):
 
         if not padding_mask.any():
             padding_mask = None
-
         for layer_idx, layer in enumerate(self.layers):
-            x, attn = layer(x, self_attn_padding_mask=padding_mask, need_head_weights=need_head_weights)
+            #x, attn = layer(x, self_attn_padding_mask=padding_mask, need_head_weights=need_head_weights)
+            neg_inf = lambda t: t.float().fill_(float("-inf")).type_as(t) 
+            zeros = torch.zeros(x.size(0), x.size(0)) 
+            causal_mask = torch.triu(neg_inf(zeros), diagonal=1).to(x.device)
+            
+            if checkpoint_activations: 
+                x, attn = deepspeed.checkpointing.checkpoint(layer,x,causal_mask,padding_mask,need_head_weights)
+            else:
+                x, attn = layer(x, self_attn_padding_mask=padding_mask,self_attn_mask=causal_mask,need_head_weights=need_head_weights)
+
             if (layer_idx + 1) in repr_layers:
                 hidden_representations[layer_idx + 1] = x.transpose(0, 1)
             if need_head_weights:
                 # (H, B, T, T) => (B, H, T, T)
                 attn_weights.append(attn.transpose(1, 0))
-
+        
         if self.model_version == 'ESM-1b':
             x = self.emb_layer_norm_after(x)
             x = x.transpose(0, 1) # (T, B, E) => (B, T, E)
@@ -208,7 +243,7 @@ class RNABertModel(nn.Module):
         else:
             x = F.linear(x, self.embed_out, bias=self.embed_out_bias)
             x = x.transpose(0, 1) # (T, B, E) => (B, T, E)
-
+        
         result = {"logits": x, "representations": hidden_representations}
         if need_head_weights:
             # attentions: B x L x H x T x T

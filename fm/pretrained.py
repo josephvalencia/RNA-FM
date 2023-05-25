@@ -32,8 +32,6 @@ def load_hub_workaround(url, download_name=None):
         )
     return data
 
-
-
 def load_regression_hub(model_name):
     url = f"https://dl.fbaipublicfiles.com/fair-esm/regression/{model_name}-contact-regression.pt"
     regression_data = load_hub_workaround(url)
@@ -45,7 +43,7 @@ def load_model_and_alphabet_hub(model_name, theme="protein"):
     regression_data = load_regression_hub(model_name)
     return load_model_and_alphabet_core(model_data, regression_data, theme)
 
-def load_model_and_alphabet_local(model_location, theme="protein"):
+def load_model_and_alphabet_local(model_location, theme="protein",override_args=None):
     """ Load from local path. The regression weights need to be co-located """
     model_data = torch.load(model_location, map_location='cpu')
     try:
@@ -53,9 +51,9 @@ def load_model_and_alphabet_local(model_location, theme="protein"):
         regression_data = torch.load(regression_location, map_location='cpu')
     except FileNotFoundError:
         regression_data = None
-    return load_model_and_alphabet_core(model_data, regression_data, theme)
+    return load_model_and_alphabet_core(model_data, regression_data, theme, override_args=override_args)
 
-def load_model_and_alphabet_core(model_data, regression_data=None, theme="protein"):
+def load_model_and_alphabet_core(model_data, regression_data=None, theme="protein",override_args=None):
     if regression_data is not None:
         model_data["model"].update(regression_data["model"])
 
@@ -67,21 +65,26 @@ def load_model_and_alphabet_core(model_data, regression_data=None, theme="protei
         prs1 = lambda s: ''.join(s.split('encoder.')[1:] if 'encoder' in s else s)
         prs2 = lambda s: ''.join(s.split('sentence_encoder.')[1:] if 'sentence_encoder' in s else s)
         model_args = {pra(arg[0]): arg[1] for arg in vars(model_data["args"]).items()}
+        if override_args is not None:
+            model_args.update(override_args)
         model_state = {prs1(prs2(arg[0])): arg[1] for arg in model_data["model"].items()}
         model_state["embed_tokens.weight"][alphabet.mask_idx].zero_()  # For token drop
         model_type = fm.RNABertModel
 
     else:
         raise ValueError("Unknown architecture selected")
-
     model = model_type(
         Namespace(**model_args), alphabet,
     )
 
+    exempt = False
+    if "q_lora_rank" in model_args or "v_lora_rank" in model_args or "k_lora_rank" in model_args:
+       exempt = True 
     expected_keys = set(model.state_dict().keys())
     found_keys = set(model_state.keys())
 
-    if regression_data is None:
+    # skip chekcing for missing keys if performing LoRA fine-tuning
+    if regression_data is None and not exempt:
         expected_missing = {"contact_head.regression.weight", "contact_head.regression.bias"}
         error_msgs = []
         missing = (expected_keys - found_keys) - expected_missing
@@ -97,20 +100,21 @@ def load_model_and_alphabet_core(model_data, regression_data=None, theme="protei
         if expected_missing - found_keys:
             warnings.warn("Regression weights not found, predicting contacts will not produce correct results.")
 
-    model.load_state_dict(model_state, strict=regression_data is not None)
+    #model.load_state_dict(model_state, strict=regression_data is not None)
+    model.load_state_dict(model_state, strict=regression_data is not None and exempt)
 
     return model, alphabet
 
 
-def rna_fm_t12(model_location=None):
+def rna_fm_t12(model_location=None,override_args=None):
     if model_location is not None and os.path.exists(model_location):
         # local
-        return load_model_and_alphabet_local(model_location, theme="rna")  # "./pretrained/RNA-FM_pretrained.pth"
+        return load_model_and_alphabet_local(model_location, theme="rna",override_args=override_args)  # "./pretrained/RNA-FM_pretrained.pth"
     else:
-        return load_rnafm_model_and_alphabet_hub("rna_fm_t12", theme="rna")
+        return load_rnafm_model_and_alphabet_hub("rna_fm_t12", theme="rna",override_args=override_args)
 
 
-def load_rnafm_model_and_alphabet_hub(model_name, theme="rna"):
+def load_rnafm_model_and_alphabet_hub(model_name, theme="rna",override_args=None):
     if model_name == "rna_fm_t12":
         url = f"https://proj.cse.cuhk.edu.hk/rnafm/api/download?filename=RNA-FM_pretrained.pth"
         model_data = load_hub_workaround(url, download_name="RNA-FM_pretrained.pth")
@@ -119,5 +123,5 @@ def load_rnafm_model_and_alphabet_hub(model_name, theme="rna"):
         regression_data = None
     else:
         raise Exception("Unknown model name: {}".format(model_name))
-    return load_model_and_alphabet_core(model_data, regression_data, theme)
+    return load_model_and_alphabet_core(model_data, regression_data, theme,override_args=override_args)
 

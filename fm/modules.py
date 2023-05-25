@@ -5,7 +5,7 @@
 
 import math
 from typing import Optional
-
+import loralib as lora
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -81,18 +81,20 @@ except ImportError:
 class TransformerLayer(nn.Module):
     """Transformer layer block."""
 
-    def __init__(self, embed_dim, ffn_embed_dim, attention_heads, add_bias_kv=True, use_esm1b_layer_norm=False):
+    def __init__(self, embed_dim, ffn_embed_dim, attention_heads, add_bias_kv=True, use_esm1b_layer_norm=False,
+                 q_lora_rank=None, k_lora_rank=None, v_lora_rank=None):
         super().__init__()
         self.embed_dim = embed_dim
         self.ffn_embed_dim = ffn_embed_dim
         self.attention_heads = attention_heads
-        self._init_submodules(add_bias_kv, use_esm1b_layer_norm)
+        self._init_submodules(add_bias_kv, use_esm1b_layer_norm,q_lora_rank,k_lora_rank,v_lora_rank)
 
-    def _init_submodules(self, add_bias_kv, use_esm1b_layer_norm):
+    def _init_submodules(self, add_bias_kv, use_esm1b_layer_norm,q_lora_rank,k_lora_rank,v_lora_rank):
         BertLayerNorm = ESM1bLayerNorm if use_esm1b_layer_norm else ESM1LayerNorm
 
         self.self_attn = MultiheadAttention(
             self.embed_dim, self.attention_heads, add_bias_kv=add_bias_kv, add_zero_attn=False,
+            q_lora_rank=q_lora_rank, k_lora_rank=k_lora_rank, v_lora_rank=v_lora_rank
         )
         self.self_attn_layer_norm = BertLayerNorm(self.embed_dim)
 
@@ -275,7 +277,8 @@ class RobertaLMHead(nn.Module):
 
     def __init__(self, embed_dim, output_dim, weight):
         super().__init__()
-        self.dense = nn.Linear(embed_dim, embed_dim)
+        #self.dense = nn.Linear(embed_dim, embed_dim)
+        self.dense = lora.Linear(embed_dim, embed_dim,r=128)
         self.layer_norm = ESM1bLayerNorm(embed_dim)
         self.weight = weight
         self.bias = nn.Parameter(torch.zeros(output_dim))
@@ -284,7 +287,6 @@ class RobertaLMHead(nn.Module):
         # only project the masked tokens while training, saves both memory and computation
         if masked_tokens is not None:
             features = features[masked_tokens, :]
-
         x = self.dense(features)
         x = gelu(x)
         x = self.layer_norm(x)
